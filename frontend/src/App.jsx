@@ -1,12 +1,30 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 
 const API_URL = "http://localhost:3000/api/ask";
+const HISTORY_URL = "http://localhost:3000/api/history";
 
 function App() {
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    async function loadHistory() {
+      try {
+        const res = await fetch(HISTORY_URL);
+        const data = await res.json();
+        const old = data.messages.map((m) => ({
+          role: m.role,
+          text: m.content,
+        }));
+        setMessages(old);
+      } catch (err) {
+        console.log("Could not load history");
+      }
+    }
+    loadHistory();
+  }, []);
 
   async function handleSend() {
     const text = question.trim();
@@ -50,11 +68,15 @@ function App() {
               borderRadius: 8,
               background: m.role === "user" ? "#2b4acb" : "#333",
               color: "white",
-              whiteSpace: "pre-wrap",
+              whiteSpace: m.role === "user" ? "pre-wrap" : "normal",
             }}
           >
-                        <b>{m.role === "user" ? "You" : "AI"}:</b>
-            {m.role === "ai" ? <ReactMarkdown>{m.text}</ReactMarkdown> : <span> {m.text}</span>}
+            <b>{m.role === "user" ? "You" : "AI"}:</b>
+            {m.role === "ai" ? (
+              <ReactMarkdown>{m.text}</ReactMarkdown>
+            ) : (
+              <span> {m.text}</span>
+            )}
           </div>
         ))}
         {loading && <p>Thinking...</p>}
