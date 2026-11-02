@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("redis");
+const { initDb, saveMessage, getRecentMessages } = require("./db");
 
 const app = express();
 app.use(cors());
@@ -39,6 +40,15 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+app.get("/api/history", async (req, res) => {
+  try {
+    const messages = await getRecentMessages(50);
+    res.json({ messages });
+  } catch (err) {
+    res.status(500).json({ error: "Could not load history" });
+  }
+});
+
 app.post("/api/ask", rateLimit, async (req, res) => {
   const { question } = req.body;
 
@@ -59,6 +69,14 @@ app.post("/api/ask", rateLimit, async (req, res) => {
         .status(502)
         .json({ error: "AI service error", detail: data.detail });
     }
+
+    try {
+      await saveMessage("user", question);
+      await saveMessage("ai", data.answer);
+    } catch (dbErr) {
+      console.log("Could not save to database:", dbErr.message);
+    }
+
     res.json(data);
   } catch (err) {
     res.status(503).json({ error: "AI service unreachable" });
@@ -72,6 +90,14 @@ async function start() {
   } catch (err) {
     console.log("Could not connect to Redis:", err.message);
   }
+
+  try {
+    await initDb();
+    console.log("Connected to PostgreSQL");
+  } catch (err) {
+    console.log("Could not connect to PostgreSQL:", err.message);
+  }
+
   app.listen(PORT, () => {
     console.log(`Gateway running on http://localhost:${PORT}`);
   });
