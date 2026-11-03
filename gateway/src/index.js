@@ -1,7 +1,9 @@
 require("dotenv").config();
+const http = require("http");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
+const { WebSocketServer } = require("ws");
 const { createClient } = require("redis");
 const { initDb, saveMessage, getRecentMessages } = require("./db");
 
@@ -24,20 +26,25 @@ const WINDOW_SECONDS = 60;
 const redis = createClient({ url: REDIS_URL });
 redis.on("error", (err) => console.log("Redis error:", err.message));
 
-async function rateLimit(req, res, next) {
+async function underLimit(ip) {
   try {
-    const key = `rate:${req.ip}`;
+    const key = `rate:${ip}`;
     const count = await redis.incr(key);
     if (count === 1) {
       await redis.expire(key, WINDOW_SECONDS);
     }
-    if (count > RATE_LIMIT) {
-      return res
-        .status(429)
-        .json({ error: "Too many requests. Please wait a minute." });
-    }
+    return count <= RATE_LIMIT;
   } catch (err) {
     console.log("Rate limit check skipped:", err.message);
+    return true;
+  }
+}
+
+async function rateLimit(req, res, next) {
+  if (!(await underLimit(req.ip))) {
+    return res
+      .status(429)
+      .json({ error: "Too many requests. Please wait a minute." });
   }
   next();
 }
@@ -134,6 +141,92 @@ app.post("/api/ask", rateLimit, async (req, res) => {
   }
 });
 
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+function send(ws, data) {
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
+}
+
+wss.on("connection", (ws, req) => {
+  const ip = req.socket.remoteAddress;
+
+  ws.on("message", async (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (e) {
+      return send(ws, { type: "error", message: "Bad message" });
+    }
+    if (msg.type !== "ask") return;
+
+    const question = msg.question;
+    if (typeof question !== "string" || !question.trim()) {
+      return send(ws, { type: "error", message: "Please type a question." });
+    }
+    if (!(await underLimit(ip))) {
+      return send(ws, {
+        type: "error",
+        message: "Too many questions. Please wait a minute.",
+      });
+    }
+
+    try {
+      const response = await fetch(`${AI_SERVICE_URL}/ask-stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+
+      if (!response.ok) {
+        return send(ws, {
+          type: "error",
+          message: "Sorry, the AI is busy right now. Please try again.",
+        });
+      }
+
+      let sources = [];
+      try {
+        sources = JSON.parse(
+          decodeURIComponent(response.headers.get("x-sources") || "[]")
+        );
+      } catch (e) {
+        sources = [];
+      }
+      send(ws, { type: "start", sources });
+
+      const decoder = new TextDecoder();
+      let full = "";
+      for await (const part of response.body) {
+        const text = decoder.decode(part, { stream: true });
+        if (text) {
+          full += text;
+          send(ws, { type: "chunk", text });
+        }
+      }
+      const tail = decoder.decode();
+      if (tail) {
+        full += tail;
+        send(ws, { type: "chunk", text: tail });
+      }
+
+      if (full.trim()) {
+        try {
+          await saveMessage("user", question);
+          await saveMessage("ai", full);
+        } catch (dbErr) {
+          console.log("Could not save to database:", dbErr.message);
+        }
+      }
+      send(ws, { type: "done" });
+    } catch (err) {
+      send(ws, { type: "error", message: "Could not reach the AI service." });
+    }
+  });
+});
+
 async function start() {
   try {
     await redis.connect();
@@ -149,7 +242,7 @@ async function start() {
     console.log("Could not connect to PostgreSQL:", err.message);
   }
 
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log(`Gateway running on http://localhost:${PORT}`);
   });
 }

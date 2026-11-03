@@ -6,3 +6,4 @@ pypdf
 psycopg[binary]
 python-multipart
 pgvector
+openai

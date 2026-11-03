@@ -1,9 +1,12 @@
+import json
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.llm import ask_llm
+from app.llm import ask_llm, stream_llm
 from app.rag import ingest_pdf, init_db, list_documents, search_chunks
 
 MAX_PDF_BYTES = 10 * 1024 * 1024
@@ -61,13 +64,17 @@ def upload(file: UploadFile = File(...)):
         raise HTTPException(status_code=502, detail=f"Upload failed: {e}")
 
 
-@app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest):
-    context = []
+def find_context(question):
     try:
-        context = search_chunks(req.question)
+        return search_chunks(question)
     except Exception as e:
         print("Note search skipped:", e)
+        return []
+
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest):
+    context = find_context(req.question)
 
     try:
         answer = ask_llm(req.question, context)
@@ -76,3 +83,32 @@ def ask(req: AskRequest):
 
     sources = sorted({c["filename"] for c in context})
     return AskResponse(answer=answer, sources=sources)
+
+
+@app.post("/ask-stream")
+def ask_stream(req: AskRequest):
+    context = find_context(req.question)
+    sources = sorted({c["filename"] for c in context})
+
+    pieces = stream_llm(req.question, context)
+    try:
+        first = next(pieces)
+    except StopIteration:
+        first = ""
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM error: {e}")
+
+    def body():
+        if first:
+            yield first
+        try:
+            for piece in pieces:
+                yield piece
+        except Exception as e:
+            print("Stream stopped early:", e)
+
+    return StreamingResponse(
+        body(),
+        media_type="text/plain; charset=utf-8",
+        headers={"X-Sources": quote(json.dumps(sources))},
+    )

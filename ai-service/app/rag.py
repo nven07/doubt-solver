@@ -94,12 +94,17 @@ def search_chunks(question, k=4):
     vec = embed_texts([question], "RETRIEVAL_QUERY")[0]
     with psycopg.connect(settings.database_url) as conn:
         rows = conn.execute(
-            "SELECT c.content, d.filename FROM chunks c "
-            "JOIN documents d ON d.id = c.document_id "
-            "ORDER BY c.embedding <=> %s::vector LIMIT %s",
+            "SELECT c.content, d.filename, c.embedding <=> %s::vector AS distance "
+            "FROM chunks c JOIN documents d ON d.id = c.document_id "
+            "ORDER BY distance LIMIT %s",
             (to_vec(vec), k),
         ).fetchall()
-    return [{"content": r[0], "filename": r[1]} for r in rows]
+    print("Note distances:", [round(r[2], 3) for r in rows])
+    return [
+        {"content": r[0], "filename": r[1]}
+        for r in rows
+        if r[2] <= settings.max_distance
+    ]
 
 
 def list_documents():
