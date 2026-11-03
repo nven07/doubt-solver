@@ -2,3 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic-settings
 google-genai
+pypdf
+psycopg[binary]
+python-multipart
+pgvector
