@@ -1,12 +1,18 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const multer = require("multer");
 const { createClient } = require("redis");
 const { initDb, saveMessage, getRecentMessages } = require("./db");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
 
 const PORT = process.env.PORT || 3000;
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://127.0.0.1:8000";
@@ -28,7 +34,7 @@ async function rateLimit(req, res, next) {
     if (count > RATE_LIMIT) {
       return res
         .status(429)
-        .json({ error: "Too many questions. Please wait a minute." });
+        .json({ error: "Too many requests. Please wait a minute." });
     }
   } catch (err) {
     console.log("Rate limit check skipped:", err.message);
@@ -47,6 +53,51 @@ app.get("/api/history", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: "Could not load history" });
   }
+});
+
+app.get("/api/documents", async (req, res) => {
+  try {
+    const response = await fetch(`${AI_SERVICE_URL}/documents`);
+    const data = await response.json();
+    res.status(response.ok ? 200 : 502).json(data);
+  } catch (err) {
+    res.status(503).json({ error: "AI service unreachable" });
+  }
+});
+
+app.post("/api/upload", rateLimit, (req, res) => {
+  upload.single("file")(req, res, async (err) => {
+    if (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    try {
+      const form = new FormData();
+      form.append(
+        "file",
+        new Blob([req.file.buffer], { type: "application/pdf" }),
+        req.file.originalname
+      );
+
+      const response = await fetch(`${AI_SERVICE_URL}/upload`, {
+        method: "POST",
+        body: form,
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        return res
+          .status(response.status === 400 ? 400 : 502)
+          .json({ error: "Upload failed", detail: data.detail });
+      }
+      res.json(data);
+    } catch (e) {
+      res.status(503).json({ error: "AI service unreachable" });
+    }
+  });
 });
 
 app.post("/api/ask", rateLimit, async (req, res) => {
