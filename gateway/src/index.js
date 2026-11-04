@@ -5,7 +5,7 @@ const cors = require("cors");
 const multer = require("multer");
 const { WebSocketServer } = require("ws");
 const { createClient } = require("redis");
-const { initDb, saveMessage, getRecentMessages } = require("./db");
+const db = require("./db");
 
 const app = express();
 app.use(cors());
@@ -25,6 +25,11 @@ const WINDOW_SECONDS = 60;
 
 const redis = createClient({ url: REDIS_URL });
 redis.on("error", (err) => console.log("Redis error:", err.message));
+
+function makeTitle(question) {
+  const clean = question.replace(/^\[Subject: [^\]]+\]\s*/, "").trim();
+  return clean.length > 60 ? clean.slice(0, 57) + "..." : clean;
+}
 
 async function underLimit(ip) {
   try {
@@ -53,12 +58,47 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-app.get("/api/history", async (req, res) => {
+app.get("/api/conversations", async (req, res) => {
   try {
-    const messages = await getRecentMessages(50);
-    res.json({ messages });
+    res.json({ conversations: await db.listConversations(50) });
   } catch (err) {
-    res.status(500).json({ error: "Could not load history" });
+    res.status(500).json({ error: "Could not load conversations" });
+  }
+});
+
+app.get("/api/conversations/:id/messages", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: "Bad conversation id" });
+  }
+  try {
+    res.json({ messages: await db.getConversationMessages(id) });
+  } catch (err) {
+    res.status(500).json({ error: "Could not load messages" });
+  }
+});
+
+app.post("/api/messages/:id/save", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    return res.status(400).json({ error: "Bad message id" });
+  }
+  try {
+    const result = await db.toggleSaved(id);
+    if (!result) {
+      return res.status(404).json({ error: "Answer not found" });
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: "Could not save answer" });
+  }
+});
+
+app.get("/api/saved", async (req, res) => {
+  try {
+    res.json({ saved: await db.listSaved() });
+  } catch (err) {
+    res.status(500).json({ error: "Could not load saved answers" });
   }
 });
 
@@ -129,8 +169,9 @@ app.post("/api/ask", rateLimit, async (req, res) => {
     }
 
     try {
-      await saveMessage("user", question);
-      await saveMessage("ai", data.answer);
+      const conv = await db.createConversation(makeTitle(question));
+      await db.saveMessage(conv.id, "user", question);
+      await db.saveMessage(conv.id, "ai", data.answer);
     } catch (dbErr) {
       console.log("Could not save to database:", dbErr.message);
     }
@@ -214,8 +255,23 @@ wss.on("connection", (ws, req) => {
 
       if (full.trim()) {
         try {
-          await saveMessage("user", question);
-          await saveMessage("ai", full);
+          let convId = Number.isInteger(msg.conversationId)
+            ? msg.conversationId
+            : null;
+          let title = null;
+          if (!convId) {
+            const conv = await db.createConversation(makeTitle(question));
+            convId = conv.id;
+            title = conv.title;
+          }
+          await db.saveMessage(convId, "user", question);
+          const aiId = await db.saveMessage(convId, "ai", full);
+          return send(ws, {
+            type: "done",
+            conversationId: convId,
+            messageId: aiId,
+            title,
+          });
         } catch (dbErr) {
           console.log("Could not save to database:", dbErr.message);
         }
@@ -236,7 +292,7 @@ async function start() {
   }
 
   try {
-    await initDb();
+    await db.initDb();
     console.log("Connected to PostgreSQL");
   } catch (err) {
     console.log("Could not connect to PostgreSQL:", err.message);

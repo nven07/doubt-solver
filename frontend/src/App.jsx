@@ -26,7 +26,7 @@ function getGreeting() {
 }
 
 function stripSubject(text) {
-  return text.replace(/^\[Subject: [^\]]+\]\s*/, "");
+  return (text || "").replace(/^\[Subject: [^\]]+\]\s*/, "");
 }
 
 function timeAgo(iso) {
@@ -42,7 +42,10 @@ function timeAgo(iso) {
 function App() {
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
-  const [chatStart, setChatStart] = useState(0);
+  const [convId, setConvId] = useState(null);
+  const [conversations, setConversations] = useState([]);
+  const [saved, setSaved] = useState([]);
+  const [expanded, setExpanded] = useState({});
   const [view, setView] = useState("home");
   const [loading, setLoading] = useState(false);
   const [documents, setDocuments] = useState([]);
@@ -57,7 +60,6 @@ function App() {
   const bottomRef = useRef(null);
   const fileRef = useRef(null);
   const inputRef = useRef(null);
-  const pendingFocus = useRef(null);
 
   async function loadDocuments() {
     try {
@@ -69,56 +71,95 @@ function App() {
     }
   }
 
-  useEffect(() => {
-    async function loadHistory() {
-      try {
-        const res = await fetch(`${BASE_URL}/history`);
-        const data = await res.json();
-        const old = data.messages.map((m) => ({
-          role: m.role,
-          text: stripSubject(m.content),
-          time: m.created_at,
-        }));
-        setMessages(old);
-        setChatStart(old.length);
-      } catch (err) {
-        console.log("Could not load history");
-      }
+  async function loadConversations() {
+    try {
+      const res = await fetch(`${BASE_URL}/conversations`);
+      const data = await res.json();
+      setConversations(data.conversations || []);
+    } catch (err) {
+      console.log("Could not load conversations");
     }
-    loadHistory();
+  }
+
+  async function loadSaved() {
+    try {
+      const res = await fetch(`${BASE_URL}/saved`);
+      const data = await res.json();
+      setSaved(data.saved || []);
+    } catch (err) {
+      console.log("Could not load saved answers");
+    }
+  }
+
+  useEffect(() => {
+    loadConversations();
     loadDocuments();
   }, []);
 
   useEffect(() => {
     if (view !== "chat") return;
-    if (pendingFocus.current !== null) {
-      document
-        .getElementById(`msg-${pendingFocus.current}`)
-        ?.scrollIntoView({ behavior: "smooth", block: "start" });
-      pendingFocus.current = null;
-    } else {
-      bottomRef.current?.scrollIntoView({
-        behavior: loading ? "auto" : "smooth",
-      });
-    }
-  }, [messages, loading, view, chatStart]);
+    bottomRef.current?.scrollIntoView({
+      behavior: loading ? "auto" : "smooth",
+    });
+  }, [messages, loading, view]);
 
   function newConversation() {
-    setChatStart(messages.length);
-    setView("home");
+    setMessages([]);
+    setConvId(null);
     setQuestion("");
-    setMenuOpen(false);
-  }
-
-  function goHome() {
     setView("home");
     setMenuOpen(false);
   }
 
-  function openActivity(index) {
-    pendingFocus.current = index;
-    setChatStart(0);
-    setView("chat");
+  function showRecent() {
+    setView("recent");
+    loadConversations();
+    setMenuOpen(false);
+  }
+
+  function showSaved() {
+    setView("saved");
+    loadSaved();
+    setMenuOpen(false);
+  }
+
+  async function openConversation(id) {
+    try {
+      const res = await fetch(`${BASE_URL}/conversations/${id}/messages`);
+      const data = await res.json();
+      setMessages(
+        (data.messages || []).map((m) => ({
+          id: m.id,
+          role: m.role,
+          text: m.role === "user" ? stripSubject(m.content) : m.content,
+          saved: m.saved,
+          time: m.created_at,
+        }))
+      );
+      setConvId(id);
+      setView("chat");
+      setMenuOpen(false);
+    } catch (err) {
+      console.log("Could not open that conversation");
+    }
+  }
+
+  async function toggleSave(id) {
+    try {
+      const res = await fetch(`${BASE_URL}/messages/${id}/save`, {
+        method: "POST",
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      setMessages((prev) =>
+        prev.map((m) => (m.id === data.id ? { ...m, saved: data.saved } : m))
+      );
+      if (!data.saved) {
+        setSaved((prev) => prev.filter((s) => s.id !== data.id));
+      }
+    } catch (err) {
+      console.log("Could not save answer");
+    }
   }
 
   function pickSubject(name) {
@@ -168,14 +209,14 @@ function App() {
     const q = text.trim();
     if (!q || loading) return;
 
-    if (view === "home") setChatStart(messages.length);
+    const startingNew = view === "home";
+    const useConv = startingNew ? null : convId;
+    if (startingNew) setConvId(null);
     setView("chat");
 
     const apiText = subject ? `[Subject: ${subject}] ${q}` : q;
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", text: q, time: new Date().toISOString() },
-    ]);
+    const userMsg = { role: "user", text: q, time: new Date().toISOString() };
+    setMessages((prev) => [...(startingNew ? [] : prev), userMsg]);
     setQuestion("");
     setLoading(true);
 
@@ -221,7 +262,13 @@ function App() {
     }
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "ask", question: apiText }));
+      ws.send(
+        JSON.stringify({
+          type: "ask",
+          question: apiText,
+          conversationId: useConv,
+        })
+      );
     };
 
     ws.onmessage = (event) => {
@@ -247,6 +294,18 @@ function App() {
           });
         }
       } else if (msg.type === "done") {
+        if (msg.conversationId) setConvId(msg.conversationId);
+        if (msg.messageId) {
+          setMessages((prev) => {
+            const copy = [...prev];
+            const last = copy[copy.length - 1];
+            if (last && last.role === "ai") {
+              copy[copy.length - 1] = { ...last, id: msg.messageId };
+            }
+            return copy;
+          });
+        }
+        loadConversations();
         finish();
       } else if (msg.type === "error") {
         finish(msg.message);
@@ -256,12 +315,6 @@ function App() {
     ws.onerror = () => finish("Could not reach the server.");
     ws.onclose = () => finish("Could not reach the server.");
   }
-
-  const recent = messages
-    .map((m, i) => ({ ...m, index: i }))
-    .filter((m) => m.role === "user")
-    .slice(-3)
-    .reverse();
 
   const lastRole = messages.length ? messages[messages.length - 1].role : null;
   const showDots = loading && lastRole === "user";
@@ -372,12 +425,17 @@ function App() {
           + New Conversation
         </button>
 
-        <button className="nav-item" onClick={goHome}>
+        <button
+          className={`nav-item ${view === "recent" ? "active" : ""}`}
+          onClick={showRecent}
+        >
           <span>🕒 Recent Doubts</span>
         </button>
-        <button className="nav-item" disabled>
+        <button
+          className={`nav-item ${view === "saved" ? "active" : ""}`}
+          onClick={showSaved}
+        >
           <span>🔖 Saved Answers</span>
-          <span className="soon">Soon</span>
         </button>
         <button className="nav-item" disabled>
           <span>📊 Study History</span>
@@ -394,7 +452,7 @@ function App() {
       </aside>
 
       <main className="main">
-        {view === "home" ? (
+        {view === "home" && (
           <div className="home">
             <div className="deco">
               <div className="arch" />
@@ -433,19 +491,19 @@ function App() {
             <div className="lower">
               <section className="activity">
                 <h3>✦ Your Recent Activity</h3>
-                {recent.length === 0 && (
+                {conversations.length === 0 && (
                   <div className="activity-empty">
                     Your recent questions will show up here.
                   </div>
                 )}
-                {recent.map((r) => (
+                {conversations.slice(0, 3).map((c) => (
                   <button
-                    key={r.index}
+                    key={c.id}
                     className="activity-row"
-                    onClick={() => openActivity(r.index)}
+                    onClick={() => openConversation(c.id)}
                   >
-                    <span className="activity-text">{r.text}</span>
-                    <span className="activity-time">{timeAgo(r.time)}</span>
+                    <span className="activity-text">{c.title}</span>
+                    <span className="activity-time">{timeAgo(c.updated_at)}</span>
                   </button>
                 ))}
               </section>
@@ -456,13 +514,80 @@ function App() {
               </aside>
             </div>
           </div>
-        ) : (
+        )}
+
+        {view === "recent" && (
+          <div className="list-page">
+            <h2>Recent Doubts</h2>
+            <p className="list-sub">Pick up any earlier conversation.</p>
+            {conversations.length === 0 && (
+              <div className="list-empty">
+                No conversations yet. Ask your first doubt!
+              </div>
+            )}
+            {conversations.map((c) => (
+              <button
+                key={c.id}
+                className="list-item"
+                onClick={() => openConversation(c.id)}
+              >
+                <span className="list-item-title">{c.title}</span>
+                <span className="list-item-time">{timeAgo(c.updated_at)}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {view === "saved" && (
+          <div className="list-page">
+            <h2>Saved Answers</h2>
+            <p className="list-sub">Answers you bookmarked to revise later.</p>
+            {saved.length === 0 && (
+              <div className="list-empty">
+                Nothing saved yet. Use "Save answer" under any AI answer.
+              </div>
+            )}
+            {saved.map((s) => (
+              <div key={s.id} className="saved-card">
+                <p className="saved-q">
+                  {stripSubject(s.question) || "Saved answer"}
+                </p>
+                <div className={`saved-body ${expanded[s.id] ? "open" : ""}`}>
+                  <ReactMarkdown>{s.content}</ReactMarkdown>
+                </div>
+                <div className="saved-actions">
+                  <button
+                    className="bookmark-btn"
+                    onClick={() =>
+                      setExpanded((prev) => ({ ...prev, [s.id]: !prev[s.id] }))
+                    }
+                  >
+                    {expanded[s.id] ? "Show less" : "Read full answer"}
+                  </button>
+                  <button
+                    className="bookmark-btn"
+                    onClick={() => openConversation(s.conversation_id)}
+                  >
+                    Open chat
+                  </button>
+                  <button
+                    className="bookmark-btn saved"
+                    onClick={() => toggleSave(s.id)}
+                  >
+                    ★ Saved
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {view === "chat" && (
           <div className="chat-view">
             <div className="chat-scroll">
-              {messages.slice(chatStart).map((m, i) => (
+              {messages.map((m, i) => (
                 <div
-                  key={chatStart + i}
-                  id={`msg-${chatStart + i}`}
+                  key={i}
                   className={`msg ${m.role === "user" ? "msg-user" : "msg-ai"}`}
                 >
                   {m.role === "ai" ? (
@@ -473,6 +598,16 @@ function App() {
                   {m.sources && m.sources.length > 0 && (
                     <div className="sources">
                       Notes searched: {m.sources.join(", ")}
+                    </div>
+                  )}
+                  {m.role === "ai" && m.id && (
+                    <div className="msg-actions">
+                      <button
+                        className={`bookmark-btn ${m.saved ? "saved" : ""}`}
+                        onClick={() => toggleSave(m.id)}
+                      >
+                        {m.saved ? "★ Saved" : "☆ Save answer"}
+                      </button>
                     </div>
                   )}
                 </div>
