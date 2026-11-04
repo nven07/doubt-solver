@@ -6,7 +6,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app.llm import ask_llm, stream_llm
+from app.agent import run_agent
+from app.llm import ask_llm
 from app.rag import ingest_pdf, init_db, list_documents, search_chunks
 
 MAX_PDF_BYTES = 10 * 1024 * 1024
@@ -87,10 +88,8 @@ def ask(req: AskRequest):
 
 @app.post("/ask-stream")
 def ask_stream(req: AskRequest):
-    context = find_context(req.question)
-    sources = sorted({c["filename"] for c in context})
+    tool, pieces, sources = run_agent(req.question)
 
-    pieces = stream_llm(req.question, context)
     try:
         first = next(pieces)
     except StopIteration:
@@ -110,5 +109,5 @@ def ask_stream(req: AskRequest):
     return StreamingResponse(
         body(),
         media_type="text/plain; charset=utf-8",
-        headers={"X-Sources": quote(json.dumps(sources))},
+        headers={"X-Sources": quote(json.dumps(sources)), "X-Tool": tool},
     )

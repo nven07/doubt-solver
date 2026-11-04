@@ -113,3 +113,14 @@ def list_documents():
             "SELECT id, filename FROM documents ORDER BY id DESC"
         ).fetchall()
     return [{"id": r[0], "filename": r[1]} for r in rows]
+
+def get_recent_chunks(limit=10):
+    with psycopg.connect(settings.database_url) as conn:
+        rows = conn.execute(
+            "SELECT c.content, d.filename FROM chunks c "
+            "JOIN documents d ON d.id = c.document_id "
+            "WHERE d.id = (SELECT MAX(id) FROM documents) "
+            "ORDER BY c.id LIMIT %s",
+            (limit,),
+        ).fetchall()
+    return [{"content": r[0], "filename": r[1]} for r in rows]
