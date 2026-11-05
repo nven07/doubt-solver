@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install packages
+        run: pip install -r ai-service/requirements.txt
+      - name: Check the code compiles
+        run: python -m compileall -q ai-service/app
+      - name: Check the app imports
+        working-directory: ai-service
+        env:
+          GEMINI_API_KEY: dummy-key-for-ci
+        run: python -c "import app.main"
+
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install and check
+        working-directory: gateway
+        run: |
+          npm ci
+          node --check src/index.js
+          node --check src/db.js
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install and build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [python, gateway, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build all images
+        run: |
+          docker build -t doubt-ai ./ai-service
+          docker build -t doubt-gateway ./gateway
+          docker build -t doubt-frontend ./frontend
