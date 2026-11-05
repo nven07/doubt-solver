@@ -123,6 +123,8 @@ def embed_texts(texts, task_type):
 def ingest_pdf(filename, data, user_id):
     reader = PdfReader(io.BytesIO(data))
     text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    text = text.encode("utf-8", "ignore").decode("utf-8")
     chunks = chunk_text(text)
     if not chunks:
         raise ValueError("No readable text found in this PDF")
