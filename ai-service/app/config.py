@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     max_distance: float = 0.43
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
+    mongo_url: str = "mongodb://127.0.0.1:27017"
 
     model_config = SettingsConfigDict(env_file=".env")
 

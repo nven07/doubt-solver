@@ -1,3 +1,7 @@
+import time
+
+from app.logs import log_event
+
 from app.llm import generate_with_fallback, stream_llm, stream_with_fallback
 from app.rag import get_recent_chunks, search_chunks
 
@@ -134,6 +138,7 @@ def tool_summary(question, user_id):
 
 
 def run_agent(question, user_id):
+    started = time.monotonic()
     tool = choose_tool(question)
     print("Agent chose tool:", tool)
     if tool == "quiz":
@@ -142,4 +147,11 @@ def run_agent(question, user_id):
         pieces, sources = tool_summary(question, user_id)
     else:
         pieces, sources = tool_answer(question, user_id)
+    log_event(
+        user_id,
+        question,
+        tool,
+        sources,
+        int((time.monotonic() - started) * 1000),
+    )
     return tool, pieces, sources

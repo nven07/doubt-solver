@@ -27,6 +27,14 @@ services:
       timeout: 3s
       retries: 10
 
+  mongo:
+    image: mongo:7
+    container_name: doubt-mongo
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongodata:/data/db
+
   ai-service:
     build: ./ai-service
     container_name: doubt-ai
@@ -39,9 +47,12 @@ services:
       EMBED_MODEL: "${EMBED_MODEL:-gemini-embedding-001}"
       MAX_DISTANCE: "${MAX_DISTANCE:-0.43}"
       DATABASE_URL: "postgresql://doubt:doubt_pass@postgres:5432/doubtsolver"
+      MONGO_URL: "mongodb://mongo:27017"
     depends_on:
       postgres:
         condition: service_healthy
+      mongo:
+        condition: service_started
 
   gateway:
     build: ./gateway
@@ -72,3 +83,4 @@ services:
 
 volumes:
   pgdata:
+  mongodata:
