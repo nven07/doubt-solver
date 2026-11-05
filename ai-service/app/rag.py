@@ -27,6 +27,9 @@ def init_db():
             """
         )
         conn.execute(
+            "ALTER TABLE documents ADD COLUMN IF NOT EXISTS user_id INTEGER"
+        )
+        conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS chunks (
                 id SERIAL PRIMARY KEY,
@@ -67,7 +70,7 @@ def embed_texts(texts, task_type):
     return vectors
 
 
-def ingest_pdf(filename, data):
+def ingest_pdf(filename, data, user_id):
     reader = PdfReader(io.BytesIO(data))
     text = "\n".join((page.extract_text() or "") for page in reader.pages)
     chunks = chunk_text(text)
@@ -78,8 +81,8 @@ def ingest_pdf(filename, data):
 
     with psycopg.connect(settings.database_url) as conn:
         doc_id = conn.execute(
-            "INSERT INTO documents (filename) VALUES (%s) RETURNING id",
-            (filename,),
+            "INSERT INTO documents (filename, user_id) VALUES (%s, %s) RETURNING id",
+            (filename, user_id),
         ).fetchone()[0]
         with conn.cursor() as cur:
             cur.executemany(
@@ -90,14 +93,22 @@ def ingest_pdf(filename, data):
     return {"document_id": doc_id, "filename": filename, "chunks": len(chunks)}
 
 
-def search_chunks(question, k=4):
-    vec = embed_texts([question], "RETRIEVAL_QUERY")[0]
+def search_chunks(question, user_id, k=4):
     with psycopg.connect(settings.database_url) as conn:
+        has_notes = conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM documents WHERE user_id = %s)",
+            (user_id,),
+        ).fetchone()[0]
+        if not has_notes:
+            return []
+
+        vec = embed_texts([question], "RETRIEVAL_QUERY")[0]
         rows = conn.execute(
             "SELECT c.content, d.filename, c.embedding <=> %s::vector AS distance "
             "FROM chunks c JOIN documents d ON d.id = c.document_id "
+            "WHERE d.user_id = %s "
             "ORDER BY distance LIMIT %s",
-            (to_vec(vec), k),
+            (to_vec(vec), user_id, k),
         ).fetchall()
     print("Note distances:", [round(r[2], 3) for r in rows])
     return [
@@ -107,20 +118,22 @@ def search_chunks(question, k=4):
     ]
 
 
-def list_documents():
+def list_documents(user_id):
     with psycopg.connect(settings.database_url) as conn:
         rows = conn.execute(
-            "SELECT id, filename FROM documents ORDER BY id DESC"
+            "SELECT id, filename FROM documents WHERE user_id = %s ORDER BY id DESC",
+            (user_id,),
         ).fetchall()
     return [{"id": r[0], "filename": r[1]} for r in rows]
 
-def get_recent_chunks(limit=10):
+
+def get_recent_chunks(user_id, limit=10):
     with psycopg.connect(settings.database_url) as conn:
         rows = conn.execute(
             "SELECT c.content, d.filename FROM chunks c "
             "JOIN documents d ON d.id = c.document_id "
-            "WHERE d.id = (SELECT MAX(id) FROM documents) "
+            "WHERE d.id = (SELECT MAX(id) FROM documents WHERE user_id = %s) "
             "ORDER BY c.id LIMIT %s",
-            (limit,),
+            (user_id, limit),
         ).fetchall()
     return [{"content": r[0], "filename": r[1]} for r in rows]

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import ReactMarkdown from "react-markdown";
+import Auth from "./Auth";
 
 const BASE_URL = "http://localhost:3000/api";
 const WS_URL = "ws://localhost:3000/ws";
@@ -40,6 +41,8 @@ function timeAgo(iso) {
 }
 
 function App() {
+  const [authChecked, setAuthChecked] = useState(false);
+  const [user, setUser] = useState(null);
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
   const [convId, setConvId] = useState(null);
@@ -57,13 +60,55 @@ function App() {
     () => QUOTES[Math.floor(Math.random() * QUOTES.length)]
   );
 
+  const tokenRef = useRef(null);
   const bottomRef = useRef(null);
   const fileRef = useRef(null);
   const inputRef = useRef(null);
 
+  function clearStoredToken() {
+    localStorage.removeItem("dz_token");
+    sessionStorage.removeItem("dz_token");
+  }
+
+  function logout() {
+    clearStoredToken();
+    tokenRef.current = null;
+    setUser(null);
+    setMessages([]);
+    setConvId(null);
+    setConversations([]);
+    setSaved([]);
+    setDocuments([]);
+    setStatus({ text: "", error: false });
+    setQuestion("");
+    setView("home");
+    setMenuOpen(false);
+  }
+
+  function handleAuth(token, newUser, remember) {
+    clearStoredToken();
+    if (remember) {
+      localStorage.setItem("dz_token", token);
+    } else {
+      sessionStorage.setItem("dz_token", token);
+    }
+    tokenRef.current = token;
+    setUser(newUser);
+  }
+
+  async function authFetch(path, options = {}) {
+    const headers = {
+      ...(options.headers || {}),
+      Authorization: `Bearer ${tokenRef.current}`,
+    };
+    const res = await fetch(`${BASE_URL}${path}`, { ...options, headers });
+    if (res.status === 401) logout();
+    return res;
+  }
+
   async function loadDocuments() {
     try {
-      const res = await fetch(`${BASE_URL}/documents`);
+      const res = await authFetch("/documents");
       const data = await res.json();
       setDocuments(data.documents || []);
     } catch (err) {
@@ -73,7 +118,7 @@ function App() {
 
   async function loadConversations() {
     try {
-      const res = await fetch(`${BASE_URL}/conversations`);
+      const res = await authFetch("/conversations");
       const data = await res.json();
       setConversations(data.conversations || []);
     } catch (err) {
@@ -83,7 +128,7 @@ function App() {
 
   async function loadSaved() {
     try {
-      const res = await fetch(`${BASE_URL}/saved`);
+      const res = await authFetch("/saved");
       const data = await res.json();
       setSaved(data.saved || []);
     } catch (err) {
@@ -92,9 +137,36 @@ function App() {
   }
 
   useEffect(() => {
-    loadConversations();
-    loadDocuments();
+    async function checkLogin() {
+      const stored =
+        localStorage.getItem("dz_token") || sessionStorage.getItem("dz_token");
+      if (stored) {
+        try {
+          const res = await fetch(`${BASE_URL}/auth/me`, {
+            headers: { Authorization: `Bearer ${stored}` },
+          });
+          if (res.ok) {
+            const data = await res.json();
+            tokenRef.current = stored;
+            setUser(data.user);
+          } else {
+            clearStoredToken();
+          }
+        } catch (err) {
+          console.log("Could not reach the server");
+        }
+      }
+      setAuthChecked(true);
+    }
+    checkLogin();
   }, []);
+
+  useEffect(() => {
+    if (user) {
+      loadConversations();
+      loadDocuments();
+    }
+  }, [user]);
 
   useEffect(() => {
     if (view !== "chat") return;
@@ -125,7 +197,7 @@ function App() {
 
   async function openConversation(id) {
     try {
-      const res = await fetch(`${BASE_URL}/conversations/${id}/messages`);
+      const res = await authFetch(`/conversations/${id}/messages`);
       const data = await res.json();
       setMessages(
         (data.messages || []).map((m) => ({
@@ -146,9 +218,7 @@ function App() {
 
   async function toggleSave(id) {
     try {
-      const res = await fetch(`${BASE_URL}/messages/${id}/save`, {
-        method: "POST",
-      });
+      const res = await authFetch(`/messages/${id}/save`, { method: "POST" });
       if (!res.ok) return;
       const data = await res.json();
       setMessages((prev) =>
@@ -183,10 +253,7 @@ function App() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const res = await fetch(`${BASE_URL}/upload`, {
-        method: "POST",
-        body: form,
-      });
+      const res = await authFetch("/upload", { method: "POST", body: form });
       const data = await res.json();
 
       if (res.ok) {
@@ -265,6 +332,7 @@ function App() {
       ws.send(
         JSON.stringify({
           type: "ask",
+          token: tokenRef.current,
           question: apiText,
           conversationId: useConv,
         })
@@ -309,11 +377,20 @@ function App() {
         finish();
       } else if (msg.type === "error") {
         finish(msg.message);
+        if (msg.code === "auth") logout();
       }
     };
 
     ws.onerror = () => finish("Could not reach the server.");
     ws.onclose = () => finish("Could not reach the server.");
+  }
+
+  if (!authChecked) {
+    return <div className="auth-loading">DoubtZen</div>;
+  }
+
+  if (!user) {
+    return <Auth onAuth={handleAuth} />;
   }
 
   const lastRole = messages.length ? messages[messages.length - 1].role : null;
@@ -447,6 +524,15 @@ function App() {
             <span>⚙ Settings</span>
             <span className="soon">Soon</span>
           </button>
+          <div className="user-row">
+            <div className="avatar">
+              {(user.name || "?").charAt(0).toUpperCase()}
+            </div>
+            <span className="user-name">{user.name}</span>
+            <button className="logout-btn" onClick={logout}>
+              Log out
+            </button>
+          </div>
           <p className="tagline">Learn. Ask. Grow.</p>
         </div>
       </aside>

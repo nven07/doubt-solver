@@ -3,6 +3,8 @@ const http = require("http");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 const { WebSocketServer } = require("ws");
 const { createClient } = require("redis");
 const db = require("./db");
@@ -19,9 +21,13 @@ const upload = multer({
 const PORT = process.env.PORT || 3000;
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://127.0.0.1:8000";
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const JWT_SECRET = process.env.JWT_SECRET;
 
 const RATE_LIMIT = 10;
+const AUTH_LIMIT = 10;
 const WINDOW_SECONDS = 60;
+
+const DUMMY_HASH = bcrypt.hashSync("not-a-real-password", 10);
 
 const redis = createClient({ url: REDIS_URL });
 redis.on("error", (err) => console.log("Redis error:", err.message));
@@ -31,22 +37,45 @@ function makeTitle(question) {
   return clean.length > 60 ? clean.slice(0, 57) + "..." : clean;
 }
 
-async function underLimit(ip) {
+async function underLimit(key, limit) {
   try {
-    const key = `rate:${ip}`;
     const count = await redis.incr(key);
     if (count === 1) {
       await redis.expire(key, WINDOW_SECONDS);
     }
-    return count <= RATE_LIMIT;
+    return count <= limit;
   } catch (err) {
     console.log("Rate limit check skipped:", err.message);
     return true;
   }
 }
 
+function makeToken(user) {
+  return jwt.sign({ uid: user.id }, JWT_SECRET, { expiresIn: "7d" });
+}
+
+function userIdFromToken(token) {
+  try {
+    const payload = jwt.verify(token || "", JWT_SECRET);
+    return Number.isInteger(payload.uid) ? payload.uid : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const userId = userIdFromToken(token);
+  if (!userId) {
+    return res.status(401).json({ error: "Please log in." });
+  }
+  req.userId = userId;
+  next();
+}
+
 async function rateLimit(req, res, next) {
-  if (!(await underLimit(req.ip))) {
+  if (!(await underLimit(`rate:${req.userId}`, RATE_LIMIT))) {
     return res
       .status(429)
       .json({ error: "Too many requests. Please wait a minute." });
@@ -54,37 +83,123 @@ async function rateLimit(req, res, next) {
   next();
 }
 
+async function authLimit(req, res, next) {
+  if (!(await underLimit(`auth:${req.ip}`, AUTH_LIMIT))) {
+    return res
+      .status(429)
+      .json({ error: "Too many attempts. Please wait a minute." });
+  }
+  next();
+}
+
+function aiHeaders(userId, extra = {}) {
+  return { "X-User-Id": String(userId), ...extra };
+}
+
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-app.get("/api/conversations", async (req, res) => {
+/* ---------- Auth ---------- */
+
+app.post("/api/auth/signup", authLimit, async (req, res) => {
+  const body = req.body || {};
+  const name = String(body.name || "").trim();
+  const email = String(body.email || "").trim().toLowerCase();
+  const password = String(body.password || "");
+
+  if (!name || name.length > 60) {
+    return res.status(400).json({ error: "Please enter your name." });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 120) {
+    return res.status(400).json({ error: "Please enter a valid email." });
+  }
+  if (password.length < 8 || password.length > 72) {
+    return res
+      .status(400)
+      .json({ error: "Password must be 8 to 72 characters." });
+  }
+
   try {
-    res.json({ conversations: await db.listConversations(50) });
+    const hash = await bcrypt.hash(password, 10);
+    const user = await db.createUser(name, email, hash);
+    res.json({ token: makeToken(user), user });
+  } catch (err) {
+    if (err.code === "23505") {
+      return res
+        .status(409)
+        .json({ error: "An account with this email already exists." });
+    }
+    console.log("Signup failed:", err.message);
+    res.status(500).json({ error: "Could not create the account." });
+  }
+});
+
+app.post("/api/auth/login", authLimit, async (req, res) => {
+  const body = req.body || {};
+  const email = String(body.email || "").trim().toLowerCase();
+  const password = String(body.password || "");
+
+  try {
+    const user = await db.findUserByEmail(email);
+    const ok = await bcrypt.compare(
+      password,
+      user ? user.password_hash : DUMMY_HASH
+    );
+    if (!user || !ok) {
+      return res.status(401).json({ error: "Incorrect email or password." });
+    }
+    res.json({
+      token: makeToken(user),
+      user: { id: user.id, name: user.name, email: user.email },
+    });
+  } catch (err) {
+    console.log("Login failed:", err.message);
+    res.status(500).json({ error: "Could not log in." });
+  }
+});
+
+app.get("/api/auth/me", requireAuth, async (req, res) => {
+  try {
+    const user = await db.findUserById(req.userId);
+    if (!user) {
+      return res.status(401).json({ error: "Please log in." });
+    }
+    res.json({ user });
+  } catch (err) {
+    res.status(500).json({ error: "Could not load your account." });
+  }
+});
+
+/* ---------- Conversations and saved answers ---------- */
+
+app.get("/api/conversations", requireAuth, async (req, res) => {
+  try {
+    res.json({ conversations: await db.listConversations(req.userId, 50) });
   } catch (err) {
     res.status(500).json({ error: "Could not load conversations" });
   }
 });
 
-app.get("/api/conversations/:id/messages", async (req, res) => {
+app.get("/api/conversations/:id/messages", requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     return res.status(400).json({ error: "Bad conversation id" });
   }
   try {
-    res.json({ messages: await db.getConversationMessages(id) });
+    res.json({ messages: await db.getConversationMessages(req.userId, id) });
   } catch (err) {
     res.status(500).json({ error: "Could not load messages" });
   }
 });
 
-app.post("/api/messages/:id/save", async (req, res) => {
+app.post("/api/messages/:id/save", requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     return res.status(400).json({ error: "Bad message id" });
   }
   try {
-    const result = await db.toggleSaved(id);
+    const result = await db.toggleSaved(req.userId, id);
     if (!result) {
       return res.status(404).json({ error: "Answer not found" });
     }
@@ -94,17 +209,21 @@ app.post("/api/messages/:id/save", async (req, res) => {
   }
 });
 
-app.get("/api/saved", async (req, res) => {
+app.get("/api/saved", requireAuth, async (req, res) => {
   try {
-    res.json({ saved: await db.listSaved() });
+    res.json({ saved: await db.listSaved(req.userId) });
   } catch (err) {
     res.status(500).json({ error: "Could not load saved answers" });
   }
 });
 
-app.get("/api/documents", async (req, res) => {
+/* ---------- Notes (PDFs) ---------- */
+
+app.get("/api/documents", requireAuth, async (req, res) => {
   try {
-    const response = await fetch(`${AI_SERVICE_URL}/documents`);
+    const response = await fetch(`${AI_SERVICE_URL}/documents`, {
+      headers: aiHeaders(req.userId),
+    });
     const data = await response.json();
     res.status(response.ok ? 200 : 502).json(data);
   } catch (err) {
@@ -112,7 +231,7 @@ app.get("/api/documents", async (req, res) => {
   }
 });
 
-app.post("/api/upload", rateLimit, (req, res) => {
+app.post("/api/upload", requireAuth, rateLimit, (req, res) => {
   upload.single("file")(req, res, async (err) => {
     if (err) {
       return res.status(400).json({ error: err.message });
@@ -131,6 +250,7 @@ app.post("/api/upload", rateLimit, (req, res) => {
 
       const response = await fetch(`${AI_SERVICE_URL}/upload`, {
         method: "POST",
+        headers: aiHeaders(req.userId),
         body: form,
       });
       const data = await response.json();
@@ -147,8 +267,10 @@ app.post("/api/upload", rateLimit, (req, res) => {
   });
 });
 
-app.post("/api/ask", rateLimit, async (req, res) => {
-  const { question } = req.body;
+/* ---------- Asking ---------- */
+
+app.post("/api/ask", requireAuth, rateLimit, async (req, res) => {
+  const { question } = req.body || {};
 
   if (typeof question !== "string" || !question.trim()) {
     return res.status(400).json({ error: "question is required" });
@@ -157,7 +279,7 @@ app.post("/api/ask", rateLimit, async (req, res) => {
   try {
     const response = await fetch(`${AI_SERVICE_URL}/ask`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: aiHeaders(req.userId, { "Content-Type": "application/json" }),
       body: JSON.stringify({ question }),
     });
     const data = await response.json();
@@ -169,7 +291,10 @@ app.post("/api/ask", rateLimit, async (req, res) => {
     }
 
     try {
-      const conv = await db.createConversation(makeTitle(question));
+      const conv = await db.createConversation(
+        req.userId,
+        makeTitle(question)
+      );
       await db.saveMessage(conv.id, "user", question);
       await db.saveMessage(conv.id, "ai", data.answer);
     } catch (dbErr) {
@@ -183,7 +308,7 @@ app.post("/api/ask", rateLimit, async (req, res) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 64 * 1024 });
 
 function send(ws, data) {
   if (ws.readyState === ws.OPEN) {
@@ -191,9 +316,7 @@ function send(ws, data) {
   }
 }
 
-wss.on("connection", (ws, req) => {
-  const ip = req.socket.remoteAddress;
-
+wss.on("connection", (ws) => {
   ws.on("message", async (raw) => {
     let msg;
     try {
@@ -203,11 +326,20 @@ wss.on("connection", (ws, req) => {
     }
     if (msg.type !== "ask") return;
 
+    const userId = userIdFromToken(msg.token);
+    if (!userId) {
+      return send(ws, {
+        type: "error",
+        code: "auth",
+        message: "Please log in again.",
+      });
+    }
+
     const question = msg.question;
     if (typeof question !== "string" || !question.trim()) {
       return send(ws, { type: "error", message: "Please type a question." });
     }
-    if (!(await underLimit(ip))) {
+    if (!(await underLimit(`rate:${userId}`, RATE_LIMIT))) {
       return send(ws, {
         type: "error",
         message: "Too many questions. Please wait a minute.",
@@ -217,7 +349,7 @@ wss.on("connection", (ws, req) => {
     try {
       const response = await fetch(`${AI_SERVICE_URL}/ask-stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: aiHeaders(userId, { "Content-Type": "application/json" }),
         body: JSON.stringify({ question }),
       });
 
@@ -255,12 +387,19 @@ wss.on("connection", (ws, req) => {
 
       if (full.trim()) {
         try {
-          let convId = Number.isInteger(msg.conversationId)
-            ? msg.conversationId
-            : null;
+          let convId = null;
+          if (
+            Number.isInteger(msg.conversationId) &&
+            (await db.conversationOwnedBy(userId, msg.conversationId))
+          ) {
+            convId = msg.conversationId;
+          }
           let title = null;
           if (!convId) {
-            const conv = await db.createConversation(makeTitle(question));
+            const conv = await db.createConversation(
+              userId,
+              makeTitle(question)
+            );
             convId = conv.id;
             title = conv.title;
           }
@@ -284,6 +423,11 @@ wss.on("connection", (ws, req) => {
 });
 
 async function start() {
+  if (!JWT_SECRET) {
+    console.log("JWT_SECRET is missing in gateway/.env. Add it and save.");
+    process.exit(1);
+  }
+
   try {
     await redis.connect();
     console.log("Connected to Redis");

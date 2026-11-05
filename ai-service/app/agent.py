@@ -47,17 +47,17 @@ def choose_tool(question):
     return keyword_route(question)
 
 
-def safe_search(question, k):
+def safe_search(question, user_id, k):
     try:
-        return search_chunks(question, k)
+        return search_chunks(question, user_id, k)
     except Exception as e:
         print("Note search skipped:", e)
         return []
 
 
-def safe_recent(limit):
+def safe_recent(user_id, limit):
     try:
-        return get_recent_chunks(limit)
+        return get_recent_chunks(user_id, limit)
     except Exception as e:
         print("Could not load recent notes:", e)
         return []
@@ -77,15 +77,15 @@ def say(text):
     yield text
 
 
-def tool_answer(question):
-    chunks = safe_search(question, 4)
+def tool_answer(question, user_id):
+    chunks = safe_search(question, user_id, 4)
     return stream_llm(question, chunks), sources_of(chunks)
 
 
-def tool_quiz(question):
-    chunks = safe_search(question, 6)
+def tool_quiz(question, user_id):
+    chunks = safe_search(question, user_id, 6)
     if not chunks and any(w in question.lower() for w in NOTES_WORDS):
-        chunks = safe_recent(8)
+        chunks = safe_recent(user_id, 8)
 
     if chunks:
         source = (
@@ -110,8 +110,8 @@ def tool_quiz(question):
     return stream_with_fallback(prompt), sources_of(chunks)
 
 
-def tool_summary(question):
-    chunks = safe_recent(10)
+def tool_summary(question, user_id):
+    chunks = safe_recent(user_id, 10)
     if not chunks:
         return (
             say(
@@ -133,13 +133,13 @@ def tool_summary(question):
     return stream_with_fallback(prompt), sources_of(chunks)
 
 
-def run_agent(question):
+def run_agent(question, user_id):
     tool = choose_tool(question)
     print("Agent chose tool:", tool)
     if tool == "quiz":
-        pieces, sources = tool_quiz(question)
+        pieces, sources = tool_quiz(question, user_id)
     elif tool == "summary":
-        pieces, sources = tool_summary(question)
+        pieces, sources = tool_summary(question, user_id)
     else:
-        pieces, sources = tool_answer(question)
+        pieces, sources = tool_answer(question, user_id)
     return tool, pieces, sources

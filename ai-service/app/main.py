@@ -2,7 +2,7 @@ import json
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -35,21 +35,34 @@ class AskResponse(BaseModel):
     sources: list[str] = []
 
 
+def get_user_id(x_user_id):
+    try:
+        return int(x_user_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Missing user")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
 @app.get("/documents")
-def documents():
+def documents(x_user_id: str | None = Header(default=None)):
+    user_id = get_user_id(x_user_id)
     try:
-        return {"documents": list_documents()}
+        return {"documents": list_documents(user_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
 
 @app.post("/upload")
-def upload(file: UploadFile = File(...)):
+def upload(
+    file: UploadFile = File(...),
+    x_user_id: str | None = Header(default=None),
+):
+    user_id = get_user_id(x_user_id)
+
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
 
@@ -58,24 +71,25 @@ def upload(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="PDF is larger than 10 MB")
 
     try:
-        return ingest_pdf(file.filename, data)
+        return ingest_pdf(file.filename, data, user_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upload failed: {e}")
 
 
-def find_context(question):
+def find_context(question, user_id):
     try:
-        return search_chunks(question)
+        return search_chunks(question, user_id)
     except Exception as e:
         print("Note search skipped:", e)
         return []
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest):
-    context = find_context(req.question)
+def ask(req: AskRequest, x_user_id: str | None = Header(default=None)):
+    user_id = get_user_id(x_user_id)
+    context = find_context(req.question, user_id)
 
     try:
         answer = ask_llm(req.question, context)
@@ -87,8 +101,9 @@ def ask(req: AskRequest):
 
 
 @app.post("/ask-stream")
-def ask_stream(req: AskRequest):
-    tool, pieces, sources = run_agent(req.question)
+def ask_stream(req: AskRequest, x_user_id: str | None = Header(default=None)):
+    user_id = get_user_id(x_user_id)
+    tool, pieces, sources = run_agent(req.question, user_id)
 
     try:
         first = next(pieces)
