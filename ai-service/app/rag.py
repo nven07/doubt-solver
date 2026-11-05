@@ -1,4 +1,6 @@
 import io
+import re
+import time
 
 import psycopg
 from google import genai
@@ -12,6 +14,10 @@ client = genai.Client(api_key=settings.gemini_api_key)
 EMBED_DIM = 768
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
+
+EMBED_BATCH = 25
+EMBED_PER_MINUTE = 80
+MAX_CHUNKS = 300
 
 
 def init_db():
@@ -55,18 +61,62 @@ def chunk_text(text):
     return chunks
 
 
+def is_rate_limited(err):
+    text = str(err)
+    return "429" in text or "RESOURCE_EXHAUSTED" in text
+
+
+def retry_wait(err):
+    found = re.search(r"retry in ([\d.]+)s", str(err))
+    seconds = float(found.group(1)) if found else 15.0
+    return min(max(seconds + 1, 5.0), 60.0)
+
+
 def embed_texts(texts, task_type):
     vectors = []
-    for i in range(0, len(texts), 50):
-        batch = texts[i : i + 50]
-        result = client.models.embed_content(
-            model=settings.embed_model,
-            contents=batch,
-            config=types.EmbedContentConfig(
-                task_type=task_type, output_dimensionality=EMBED_DIM
-            ),
-        )
+    window_start = time.monotonic()
+    used = 0
+
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i : i + EMBED_BATCH]
+
+        elapsed = time.monotonic() - window_start
+        if elapsed >= 60:
+            window_start = time.monotonic()
+            used = 0
+        elif used + len(batch) > EMBED_PER_MINUTE:
+            time.sleep(60 - elapsed + 1)
+            window_start = time.monotonic()
+            used = 0
+
+        result = None
+        for attempt in range(5):
+            try:
+                result = client.models.embed_content(
+                    model=settings.embed_model,
+                    contents=batch,
+                    config=types.EmbedContentConfig(
+                        task_type=task_type, output_dimensionality=EMBED_DIM
+                    ),
+                )
+                break
+            except Exception as e:
+                if not is_rate_limited(e):
+                    raise
+                wait = retry_wait(e)
+                print(f"Embedding limit hit, waiting {wait:.0f}s (try {attempt + 1})")
+                time.sleep(wait)
+                window_start = time.monotonic()
+                used = 0
+
+        if result is None:
+            raise RuntimeError(
+                "Gemini embedding limit reached. Please try again in a minute."
+            )
+
+        used += len(batch)
         vectors.extend([e.values for e in result.embeddings])
+
     return vectors
 
 
@@ -76,7 +126,13 @@ def ingest_pdf(filename, data, user_id):
     chunks = chunk_text(text)
     if not chunks:
         raise ValueError("No readable text found in this PDF")
+    if len(chunks) > MAX_CHUNKS:
+        raise ValueError(
+            f"This PDF is too long for the free plan ({len(chunks)} pieces, "
+            f"the limit is {MAX_CHUNKS}). Please upload a shorter chapter."
+        )
 
+    print(f"Embedding {len(chunks)} pieces from {filename}...")
     vectors = embed_texts(chunks, "RETRIEVAL_DOCUMENT")
 
     with psycopg.connect(settings.database_url) as conn:
