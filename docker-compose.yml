@@ -60,6 +60,7 @@ services:
     environment:
       PORT: "3000"
       AI_SERVICE_URL: "http://ai-service:8000"
+      GRPC_URL: "ai-service:50051"
       REDIS_URL: "redis://redis:6379"
       DATABASE_URL: "postgres://doubt:doubt_pass@postgres:5432/doubtsolver"
       JWT_SECRET: "${JWT_SECRET:?Add JWT_SECRET to the .env file}"

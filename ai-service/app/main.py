@@ -20,7 +20,19 @@ async def lifespan(app: FastAPI):
         print("Database ready")
     except Exception as e:
         print("Could not set up database:", e)
+
+    grpc_server = None
+    try:
+        from app.grpc_server import start_grpc
+
+        grpc_server = start_grpc()
+    except Exception as e:
+        print("gRPC server not started:", e)
+
     yield
+
+    if grpc_server:
+        grpc_server.stop(0)
 
 
 app = FastAPI(title="Doubt Solver AI Service", lifespan=lifespan)

@@ -1,10 +1,13 @@
 require("dotenv").config();
 const http = require("http");
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const grpc = require("@grpc/grpc-js");
+const protoLoader = require("@grpc/proto-loader");
 const { WebSocketServer } = require("ws");
 const { createClient } = require("redis");
 const db = require("./db");
@@ -20,6 +23,7 @@ const upload = multer({
 
 const PORT = process.env.PORT || 3000;
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://127.0.0.1:8000";
+const GRPC_URL = process.env.GRPC_URL || "127.0.0.1:50051";
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const JWT_SECRET = process.env.JWT_SECRET;
 
@@ -28,6 +32,16 @@ const AUTH_LIMIT = 10;
 const WINDOW_SECONDS = 60;
 
 const DUMMY_HASH = bcrypt.hashSync("not-a-real-password", 10);
+
+const packageDef = protoLoader.loadSync(
+  path.join(__dirname, "..", "doubt.proto"),
+  { keepCase: true, longs: Number, enums: String, oneofs: true }
+);
+const doubtProto = grpc.loadPackageDefinition(packageDef).doubt;
+const assistant = new doubtProto.Assistant(
+  GRPC_URL,
+  grpc.credentials.createInsecure()
+);
 
 const redis = createClient({ url: REDIS_URL });
 redis.on("error", (err) => console.log("Redis error:", err.message));
@@ -94,6 +108,25 @@ async function authLimit(req, res, next) {
 
 function aiHeaders(userId, extra = {}) {
   return { "X-User-Id": String(userId), ...extra };
+}
+
+function askStream(userId, question, handlers) {
+  return new Promise((resolve, reject) => {
+    const call = assistant.AskStream(
+      { question, user_id: userId },
+      new grpc.Metadata(),
+      { deadline: Date.now() + 120000 }
+    );
+    call.on("data", (chunk) => {
+      if (chunk.start) {
+        handlers.onStart(chunk.start);
+      } else if (typeof chunk.text === "string") {
+        handlers.onText(chunk.text);
+      }
+    });
+    call.on("end", resolve);
+    call.on("error", reject);
+  });
 }
 
 app.get("/api/health", (req, res) => {
@@ -346,79 +379,54 @@ wss.on("connection", (ws) => {
       });
     }
 
+    let full = "";
     try {
-      const response = await fetch(`${AI_SERVICE_URL}/ask-stream`, {
-        method: "POST",
-        headers: aiHeaders(userId, { "Content-Type": "application/json" }),
-        body: JSON.stringify({ question }),
-      });
-
-      if (!response.ok) {
-        return send(ws, {
-          type: "error",
-          message: "Sorry, the AI is busy right now. Please try again.",
-        });
-      }
-
-      let sources = [];
-      try {
-        sources = JSON.parse(
-          decodeURIComponent(response.headers.get("x-sources") || "[]")
-        );
-      } catch (e) {
-        sources = [];
-      }
-      send(ws, { type: "start", sources });
-
-      const decoder = new TextDecoder();
-      let full = "";
-      for await (const part of response.body) {
-        const text = decoder.decode(part, { stream: true });
-        if (text) {
+      await askStream(userId, question, {
+        onStart: (s) => {
+          console.log(`gRPC stream opened (tool: ${s.tool})`);
+          send(ws, { type: "start", sources: s.sources || [], tool: s.tool });
+        },
+        onText: (text) => {
           full += text;
           send(ws, { type: "chunk", text });
-        }
-      }
-      const tail = decoder.decode();
-      if (tail) {
-        full += tail;
-        send(ws, { type: "chunk", text: tail });
-      }
-
-      if (full.trim()) {
-        try {
-          let convId = null;
-          if (
-            Number.isInteger(msg.conversationId) &&
-            (await db.conversationOwnedBy(userId, msg.conversationId))
-          ) {
-            convId = msg.conversationId;
-          }
-          let title = null;
-          if (!convId) {
-            const conv = await db.createConversation(
-              userId,
-              makeTitle(question)
-            );
-            convId = conv.id;
-            title = conv.title;
-          }
-          await db.saveMessage(convId, "user", question);
-          const aiId = await db.saveMessage(convId, "ai", full);
-          return send(ws, {
-            type: "done",
-            conversationId: convId,
-            messageId: aiId,
-            title,
-          });
-        } catch (dbErr) {
-          console.log("Could not save to database:", dbErr.message);
-        }
-      }
-      send(ws, { type: "done" });
+        },
+      });
     } catch (err) {
-      send(ws, { type: "error", message: "Could not reach the AI service." });
+      console.log("gRPC call failed:", err.code, err.details || err.message);
+      return send(ws, {
+        type: "error",
+        message: "Sorry, the AI is busy right now. Please try again.",
+      });
     }
+
+    if (full.trim()) {
+      try {
+        let convId = null;
+        if (
+          Number.isInteger(msg.conversationId) &&
+          (await db.conversationOwnedBy(userId, msg.conversationId))
+        ) {
+          convId = msg.conversationId;
+        }
+        let title = null;
+        if (!convId) {
+          const conv = await db.createConversation(userId, makeTitle(question));
+          convId = conv.id;
+          title = conv.title;
+        }
+        await db.saveMessage(convId, "user", question);
+        const aiId = await db.saveMessage(convId, "ai", full);
+        return send(ws, {
+          type: "done",
+          conversationId: convId,
+          messageId: aiId,
+          title,
+        });
+      } catch (dbErr) {
+        console.log("Could not save to database:", dbErr.message);
+      }
+    }
+    send(ws, { type: "done" });
   });
 });
 
