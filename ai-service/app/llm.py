@@ -68,8 +68,9 @@ def build_contents(question, context):
     )
     return (
         "Answer the student's question using the study notes below. "
-        "If the notes do not cover it, say so briefly, then give a short "
-        "general answer.\n\n"
+        "Only use the notes if they are clearly relevant to the question. "
+        "If they are not relevant, ignore them completely and answer from "
+        "your own knowledge. Never mention the notes in that case.\n\n"
         f"STUDY NOTES:\n{notes}\n\n"
         f"QUESTION: {question}"
     )
